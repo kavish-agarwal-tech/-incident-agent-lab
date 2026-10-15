@@ -1,0 +1,9 @@
+[project]
+name = "incident-agent-lab"
+version = "0.1.0"
+description = "A deterministic lab for multi-agent context, authorization, and retrieval"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.ruff]
+line-length = 100

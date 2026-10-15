@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "description": "Golden questions for comparing chunking strategies. Metrics are descriptive; feature evals provide hard assertions.",
+  "questions": [
+    {"id": "q1", "query": "rollback prerequisites", "expected_document": "runbook-checkout", "required_phrases": ["incompatible database migration", "v41 is healthy and available", "incident manager approval"]},
+    {"id": "q2", "query": "connection pool configuration deployment v42 diagnosis", "expected_document": "runbook-checkout", "required_phrases": ["pool from 50 to 2", "hypothesis", "verify recovery metrics"]},
+    {"id": "q3", "query": "verification after rollback error rate", "expected_document": "runbook-checkout", "required_phrases": ["check error rate", "keep the incident open"]},
+    {"id": "q4", "query": "image cache broken thumbnails", "expected_document": "unrelated-incident", "required_phrases": ["Clear image cache"]}
+  ]
+}
