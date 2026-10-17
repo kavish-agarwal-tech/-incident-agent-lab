@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def expect(condition, explanation):
+    # Use an explicit exception so assertions remain active even under python -O.
     if not condition:
         raise AssertionError(explanation)
 
@@ -29,6 +30,8 @@ def scenario(name, store, runtime):
         path = store.db.execute("PRAGMA database_list").fetchone()[2]
 
         def command(*arguments, expected_code=0):
+            # Use the current interpreter and an argument list, not a shell command.
+            # Every subprocess receives the same DB path but a fresh in-memory runtime.
             process = subprocess.run(
                 [sys.executable, "-m", "incident_lab", *arguments, "--db", path],
                 cwd=ROOT, text=True, capture_output=True, timeout=15,
@@ -67,6 +70,7 @@ def scenario(name, store, runtime):
         expect(store.get("deployment", "checkout")["version"] == "v42", "Deployment changed")
         return {"status": result["status"]}
     if name in {"bounded_handoff", "delegation_escalation"}:
+        # Start with a small parent grant so the escalation attempt has an explicit ceiling.
         parent = runtime.session("alice", "coordinator", "INC-101", SCOPE, {"docs.read"})
         child, envelope = runtime.delegate(parent, "researcher", "task-1", "Find prerequisites",
                                            {"docs.read"}, ["runbook-checkout"])
@@ -88,6 +92,8 @@ def scenario(name, store, runtime):
         checkpoint = store.get("checkpoint", "INC-101:logs")
         path = store.db.execute("PRAGMA database_list").fetchone()[2]
         reopened = Store(path)
+        # A second connection verifies persistence; reusing the original Context
+        # object would not establish that its working state survived a restart.
         try:
             restored = Context.resume(reopened, "INC-101:logs")
             expect(restored.state == checkpoint["state"], "Checkpoint lost state")
@@ -114,6 +120,8 @@ def scenario(name, store, runtime):
         handle = runtime.session("victor", "remediator", "INC-101", SCOPE, {"docs.read"})
         runtime.call(handle, "rollback.execute", {"proposal_id": "does-not-exist"})
     if name in {"investigator_execute", "task_grant"}:
+        # Hold Carol's user role fixed and vary only the agent or task grant to
+        # isolate the permission dimension responsible for the expected denial.
         agent = "investigator" if name == "investigator_execute" else "remediator"
         handle = runtime.session("carol", agent, "INC-101", SCOPE, {"docs.read"})
         runtime.call(handle, "rollback.execute", {"proposal_id": "does-not-exist"})
@@ -133,6 +141,7 @@ def scenario(name, store, runtime):
     if name == "user_revoked":
         handle = runtime.session("carol", "remediator", "INC-101", SCOPE, {"rollback.execute"})
         runtime.users["carol"]["role"] = "viewer"
+        # Reuse the old session: authorization must consult current user rights.
         runtime.call(handle, "rollback.execute", {"proposal_id": "x"})
     if name == "grant_mint_ceiling":
         runtime.session("victor", "remediator", "INC-101", SCOPE, {"rollback.execute"})
@@ -155,6 +164,8 @@ def scenario(name, store, runtime):
     if name == "unknown_session":
         runtime.call("caller-invented", "docs.read", {"evidence_id": "runbook-checkout"})
     if name == "injection":
+        # This checks the scripted data/authority boundary. It does not exercise
+        # a real model's tendency to follow malicious retrieved instructions.
         investigate(runtime)
         logs = store.get("evidence", "logs-101")
         expect(any("export secrets" in r["text"] for r in logs["records"]), "Attack absent")
@@ -175,11 +186,14 @@ def scenario(name, store, runtime):
     if name == "checkpoint_no_authority":
         checkpoint = store.get("checkpoint", "INC-101:logs")
         checkpoint["state"]["approved"] = True
+        # An attacker-controlled memory claim must not substitute for Store approval state.
         store.put("checkpoint", "INC-101:logs", checkpoint)
         Context.resume(store, "INC-101:logs")
     if name in {"approval_missing", "checkpoint_no_authority"}:
         runtime.call(handle, "rollback.execute", {"proposal_id": key})
     if name == "proposal_conflict":
+        # Reuse Alice's action ID as Carol. Even the same version transition is a
+        # different proposal because the proposer is part of the bound payload.
         other = runtime.session("carol", "remediator", "INC-101", SCOPE, {"rollback.propose"})
         runtime.call(other, "rollback.propose", {k: proposal[k] for k in
                      ("action_id", "incident", "from_version", "to_version")})
@@ -191,6 +205,8 @@ def scenario(name, store, runtime):
         original_event = store.event
 
         def failing_event(event_name, **body):
+            # Fail after the deployment/execution writes but before their transaction
+            # commits. The post-failure assertions must find none of those writes.
             if event_name == "tool.allowed" and body.get("action") == "rollback.execute":
                 raise OSError("Simulated audit write failure before commit")
             return original_event(event_name, **body)
@@ -204,6 +220,7 @@ def scenario(name, store, runtime):
             else:
                 raise AssertionError("Fault injection did not run")
         finally:
+            # Restore the store method so later inspection uses its normal behavior.
             store.event = original_event
         expect(store.get("deployment", "checkout")["version"] == "v42", "Partial deployment write")
         expect(not store.all("execution"), "Partial execution record survived")
@@ -215,10 +232,13 @@ def scenario(name, store, runtime):
         barrier = Barrier(2)
 
         def worker():
+            # SQLite connections belong to their creating thread. Independent
+            # connections also model competing callers more faithfully than one shared handle.
             connection = Store(path)
             try:
                 fresh = Runtime(connection)
                 token = execution_session(fresh, proposal)
+                # Align both callers immediately before invocation to exercise lock contention.
                 barrier.wait(timeout=10)
                 return fresh.call(token, "rollback.execute", {"proposal_id": key})
             finally:
@@ -234,8 +254,11 @@ def scenario(name, store, runtime):
             "Concurrent invocation duplicated the side effect")
         return {"concurrent_callers": 2, "executions": 1, "replays": 1}
     if name == "expired_approval":
+        # Advance the injected authorization clock without making the eval sleep.
         runtime.clock = lambda: 10**12
     if name == "changed_proposal":
+        # Direct DB editing is a fault fixture, not an exposed agent capability.
+        # It tests that approval hashes detect a proposal changed after approval.
         store.put("proposal", key, {**proposal, "to_version": "v40"})
     if name == "workflow_mismatch":
         handle = runtime.session("carol", "remediator", "INC-OTHER", SCOPE, {"rollback.execute"})
@@ -258,6 +281,7 @@ def scenario(name, store, runtime):
             retry = runtime.call(handle, "rollback.execute", {"proposal_id": key})
         expect(retry["replayed"] and not result["replayed"], "Retry executed again")
         expect(len(store.all("execution")) == 1, "Duplicate execution record")
+        # Count successful side effects too; returning a replay flag alone is insufficient.
         expect(sum(e["event"] == "execution.completed" for e in store.events()) == 1,
                "Duplicate side effect")
         return {"executions": 1, "retry_replayed": True}
@@ -267,6 +291,7 @@ def scenario(name, store, runtime):
 def chunk_scenario(name, store):
     document = store.get("evidence", "runbook-checkout")
     if name == "chunk_provenance":
+        # Verify every strategy's actual text against its source span, not just its IDs.
         counts = {}
         for strategy in STRATEGIES:
             chunks = chunk_document(document, strategy)
@@ -278,6 +303,8 @@ def chunk_scenario(name, store):
             counts[strategy] = len(chunks)
         return {"chunk_counts": counts}
     if name == "overlap":
+        # Words four/five straddle the five-word fixed boundary; overlap should
+        # preserve the phrase in one chunk without changing the source document.
         fixture = {**document, "text": "zero one two three four five six seven eight nine"}
         phrase = "four five"
         fixed = chunk_document(fixture, "fixed", size=5, overlap=2)
@@ -296,6 +323,8 @@ def chunk_scenario(name, store):
                "Missing prerequisite")
         return {"retrieved": hits[0]["id"]}
     if name == "parent_expansion":
+        # Search with deliberately small children, then require content located
+        # elsewhere in the matched parent section to prove expansion occurred.
         hits = retrieve([document], "parent_child", "rollback prerequisites", top_k=1, size=12)
         expect(hits and hits[0]["parent_id"], "Parent reference missing")
         expect("manager approval" in hits[0]["text"] and len(hits[0]["text"].split()) > 12,
@@ -316,6 +345,8 @@ def run_features(dataset=None):
     cases = json.loads(Path(dataset).read_text(encoding="utf-8"))["cases"]
     results = []
     for case in cases:
+        # Disk-backed isolation permits reopen/concurrency tests without letting
+        # one case's approvals or deployment version influence the next case.
         with TemporaryDirectory(prefix="incident-lab-eval-") as directory:
             store = Store(Path(directory) / "case.db")
             seed(store)
@@ -324,13 +355,16 @@ def run_features(dataset=None):
             try:
                 details = scenario(case["scenario"], store, runtime) or {}
             except Denied as exc:
+                # A denial is an expected result in negative cases, not a runner error.
                 actual = str(exc)
                 # All denied execution cases must have no completed execution.
                 if store.all("execution"):
                     actual = "error: denied operation nevertheless executed"
             except Exception as exc:
+                # Keep running other cases, but report unexpected failures visibly.
                 actual = f"error: {type(exc).__name__}: {exc}"
             finally:
+                # Capture evidence before closing the connection and deleting its temp directory.
                 trace = store.events()
                 store.close()
             results.append({**case, "actual": actual, "passed": actual == case["expected"],
@@ -352,12 +386,17 @@ def run_retrieval():
         results = []
         for strategy in STRATEGIES:
             for question in questions:
+                # Keep corpus, question and top-k fixed while varying the splitter.
                 hits = retrieve(documents, strategy, question["query"])
                 text = " ".join(hit["text"].lower() for hit in hits)
                 covered = [p for p in question["required_phrases"] if p.lower() in text]
+                # Exact phrase coverage is a transparent completeness proxy, not
+                # semantic answer correctness. Extra words and irrelevant hits carry a cost.
                 all_words = sum(len(h["text"].split()) for h in hits)
                 unique_positions = {(h["document_id"], i) for h in hits
                                     for i in range(h["start"], h["end"])}
+                # Count source positions once to measure duplicated overlapping
+                # context; identical words at different source positions are not duplicates.
                 total_positions = sum(h["end"] - h["start"] for h in hits)
                 results.append({"strategy": strategy, "question_id": question["id"],
                     "document_hit": any(h["document_id"] == question["expected_document"] for h in hits),

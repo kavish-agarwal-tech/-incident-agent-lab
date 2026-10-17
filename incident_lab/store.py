@@ -10,8 +10,12 @@ class Store:
     def __init__(self, path=":memory:"):
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+        # Use autocommit for individual writes; transaction() explicitly groups the
+        # approval checks and simulated deployment mutation that must be atomic.
         self.db = sqlite3.connect(str(path), isolation_level=None)
         self.db.execute("PRAGMA busy_timeout = 5000")
+        # Objects keep JSON records keyed by kind + ID. Events form a separate,
+        # ordered trace; they are durable, but not protected from direct DB editing.
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS objects (
                 kind TEXT NOT NULL, id TEXT NOT NULL, body TEXT NOT NULL,
@@ -25,6 +29,8 @@ class Store:
         """)
 
     def put(self, kind, key, value):
+        # Upsert makes checkpoints replaceable. Higher-level runtime handlers enforce
+        # stronger rules, such as refusing different proposals under the same action ID.
         self.db.execute(
             "INSERT INTO objects VALUES (?, ?, ?) "
             "ON CONFLICT(kind, id) DO UPDATE SET body=excluded.body",
@@ -32,6 +38,7 @@ class Store:
         )
 
     def get(self, kind, key):
+        # Bound SQL parameters treat IDs as values rather than executable SQL text.
         row = self.db.execute(
             "SELECT body FROM objects WHERE kind=? AND id=?", (kind, key)
         ).fetchone()
@@ -56,6 +63,7 @@ class Store:
         )
 
     def events(self):
+        # Sequence, rather than timestamp alone, preserves order for near-simultaneous events.
         return [dict(sequence=row[0], at=row[1], event=row[2], **json.loads(row[3]))
                 for row in self.db.execute(
                     "SELECT sequence, at, event, body FROM events ORDER BY sequence"
@@ -64,13 +72,17 @@ class Store:
     @contextmanager
     def transaction(self):
         """Serialize approval checks and simulated writes, including idempotency checks."""
+        # Take the write reservation before reading the execution record so concurrent
+        # callers cannot both see "not executed" and apply the same simulated action.
         self.db.execute("BEGIN IMMEDIATE")
         try:
             yield
         except BaseException:
+            # Include interruptions as well as ordinary errors in rollback handling.
             self.db.rollback()
             raise
         else:
+            # A successful caller publishes all grouped writes at this point.
             self.db.commit()
 
     def close(self):
